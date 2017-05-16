@@ -20,6 +20,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.internal.UnstableApi;
 
+import static io.netty.handler.codec.http2.Http2CodecUtil.verifyPadding;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 /**
@@ -64,21 +65,25 @@ public final class DefaultHttp2DataFrame extends AbstractHttp2StreamFrame implem
      *
      * @param content non-{@code null} payload
      * @param endStream whether this data should terminate the stream
-     * @param padding additional bytes that should be added to obscure the true content size
+     * @param padding additional bytes that should be added to obscure the true content size. Must be between 0 and
+     *                256 (inclusive).
      */
     public DefaultHttp2DataFrame(ByteBuf content, boolean endStream, int padding) {
         this.content = checkNotNull(content, "content");
         this.endStream = endStream;
-        if (padding < 0 || padding > Http2CodecUtil.MAX_UNSIGNED_BYTE) {
-            throw new IllegalArgumentException("padding must be non-negative and less than 256");
-        }
+        verifyPadding(padding);
         this.padding = padding;
     }
 
     @Override
-    public DefaultHttp2DataFrame setStream(Object stream) {
-      super.setStream(stream);
-      return this;
+    public DefaultHttp2DataFrame streamId(int streamId) {
+        super.streamId(streamId);
+        return this;
+    }
+
+    @Override
+    public String name() {
+        return "DATA";
     }
 
     @Override
@@ -148,8 +153,8 @@ public final class DefaultHttp2DataFrame extends AbstractHttp2StreamFrame implem
 
     @Override
     public String toString() {
-        return "DefaultHttp2DataFrame(stream=" + stream() + ", content=" + content
-            + ", endStream=" + endStream + ", padding=" + padding + ")";
+        return "DefaultHttp2DataFrame(streamId=" + streamId() + ", content=" + content
+               + ", endStream=" + endStream + ", padding=" + padding + ")";
     }
 
     @Override

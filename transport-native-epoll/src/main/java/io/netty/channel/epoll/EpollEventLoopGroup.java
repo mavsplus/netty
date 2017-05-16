@@ -22,6 +22,8 @@ import io.netty.channel.MultithreadEventLoopGroup;
 import io.netty.channel.SelectStrategyFactory;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.EventExecutorChooserFactory;
+import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
@@ -31,6 +33,10 @@ import java.util.concurrent.ThreadFactory;
  * it only works on linux.
  */
 public final class EpollEventLoopGroup extends MultithreadEventLoopGroup {
+    static {
+        // Ensure JNI is initialized by the time this class is loaded by this time!
+        Epoll.ensureAvailability();
+    }
 
     /**
      * Create a new instance using the default number of threads and the default {@link ThreadFactory}.
@@ -95,16 +101,26 @@ public final class EpollEventLoopGroup extends MultithreadEventLoopGroup {
     @Deprecated
     public EpollEventLoopGroup(int nThreads, ThreadFactory threadFactory, int maxEventsAtOnce,
                                SelectStrategyFactory selectStrategyFactory) {
-        super(nThreads, threadFactory, maxEventsAtOnce, selectStrategyFactory);
+        super(nThreads, threadFactory, maxEventsAtOnce, selectStrategyFactory, RejectedExecutionHandlers.reject());
+        Epoll.ensureAvailability();
     }
 
     public EpollEventLoopGroup(int nThreads, Executor executor, SelectStrategyFactory selectStrategyFactory) {
-        super(nThreads, executor, 0, selectStrategyFactory);
+        super(nThreads, executor, 0, selectStrategyFactory, RejectedExecutionHandlers.reject());
+        Epoll.ensureAvailability();
     }
 
     public EpollEventLoopGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory,
                                SelectStrategyFactory selectStrategyFactory) {
-        super(nThreads, executor, chooserFactory, 0, selectStrategyFactory);
+        super(nThreads, executor, chooserFactory, 0, selectStrategyFactory, RejectedExecutionHandlers.reject());
+        Epoll.ensureAvailability();
+    }
+
+    public EpollEventLoopGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory,
+                               SelectStrategyFactory selectStrategyFactory,
+                               RejectedExecutionHandler rejectedExecutionHandler) {
+        super(nThreads, executor, chooserFactory, 0, selectStrategyFactory, rejectedExecutionHandler);
+        Epoll.ensureAvailability();
     }
 
     /**
@@ -120,6 +136,6 @@ public final class EpollEventLoopGroup extends MultithreadEventLoopGroup {
     @Override
     protected EventLoop newChild(Executor executor, Object... args) throws Exception {
         return new EpollEventLoop(this, executor, (Integer) args[0],
-                ((SelectStrategyFactory) args[1]).newSelectStrategy());
+                ((SelectStrategyFactory) args[1]).newSelectStrategy(), (RejectedExecutionHandler) args[2]);
     }
 }

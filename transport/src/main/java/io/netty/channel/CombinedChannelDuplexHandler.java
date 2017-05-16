@@ -19,7 +19,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.EventExecutor;
-import io.netty.util.internal.ThrowableUtils;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -45,12 +45,15 @@ public class CombinedChannelDuplexHandler<I extends ChannelInboundHandler, O ext
      * {@link #init(ChannelInboundHandler, ChannelOutboundHandler)} before adding this handler into a
      * {@link ChannelPipeline}.
      */
-    protected CombinedChannelDuplexHandler() { }
+    protected CombinedChannelDuplexHandler() {
+        ensureNotSharable();
+    }
 
     /**
      * Creates a new instance that combines the specified two handlers into one.
      */
     public CombinedChannelDuplexHandler(I inboundHandler, O outboundHandler) {
+        ensureNotSharable();
         init(inboundHandler, outboundHandler);
     }
 
@@ -148,7 +151,7 @@ public class CombinedChannelDuplexHandler<I extends ChannelInboundHandler, O ext
                                     "An exception {}" +
                                     "was thrown by a user handler's exceptionCaught() " +
                                     "method while handling the following exception:",
-                                    ThrowableUtils.stackTraceToString(error), cause);
+                                    ThrowableUtil.stackTraceToString(error), cause);
                         } else if (logger.isWarnEnabled()) {
                             logger.warn(
                                     "An exception '{}' [enable DEBUG level for full stacktrace] " +

@@ -16,16 +16,21 @@
 package io.netty.util;
 
 import io.netty.util.internal.PlatformDependent;
-import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.SocketUtils;
+import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.UnknownHostException;
@@ -118,9 +123,15 @@ public final class NetUtil {
     private static final int IPV4_SEPARATORS = 3;
 
     /**
-     * {@code true} if ipv4 should be used on a system that supports ipv4 and ipv6.
+     * {@code true} if IPv4 should be used even if the system supports both IPv4 and IPv6.
      */
-    private static final boolean IPV4_PREFERRED = Boolean.getBoolean("java.net.preferIPv4Stack");
+    private static final boolean IPV4_PREFERRED = SystemPropertyUtil.getBoolean("java.net.preferIPv4Stack", false);
+
+    /**
+     * {@code true} if an IPv6 address should be preferred when a host has both an IPv4 address and an IPv6 address.
+     */
+    private static final boolean IPV6_ADDRESSES_PREFERRED =
+            SystemPropertyUtil.getBoolean("java.net.preferIPv6Addresses", false);
 
     /**
      * The logger being used by this class
@@ -128,13 +139,16 @@ public final class NetUtil {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(NetUtil.class);
 
     static {
+        logger.debug("-Djava.net.preferIPv4Stack: {}", IPV4_PREFERRED);
+        logger.debug("-Djava.net.preferIPv6Addresses: {}", IPV6_ADDRESSES_PREFERRED);
+
         byte[] LOCALHOST4_BYTES = {127, 0, 0, 1};
         byte[] LOCALHOST6_BYTES = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
         // Create IPv4 loopback address.
         Inet4Address localhost4 = null;
         try {
-            localhost4 = (Inet4Address) InetAddress.getByAddress(LOCALHOST4_BYTES);
+            localhost4 = (Inet4Address) InetAddress.getByAddress("localhost", LOCALHOST4_BYTES);
         } catch (Exception e) {
             // We should not get here as long as the length of the address is correct.
             PlatformDependent.throwException(e);
@@ -144,7 +158,7 @@ public final class NetUtil {
         // Create IPv6 loopback address.
         Inet6Address localhost6 = null;
         try {
-            localhost6 = (Inet6Address) InetAddress.getByAddress(LOCALHOST6_BYTES);
+            localhost6 = (Inet6Address) InetAddress.getByAddress("localhost", LOCALHOST6_BYTES);
         } catch (Exception e) {
             // We should not get here as long as the length of the address is correct.
             PlatformDependent.throwException(e);
@@ -154,11 +168,14 @@ public final class NetUtil {
         // Retrieve the list of available network interfaces.
         List<NetworkInterface> ifaces = new ArrayList<NetworkInterface>();
         try {
-            for (Enumeration<NetworkInterface> i = NetworkInterface.getNetworkInterfaces(); i.hasMoreElements();) {
-                NetworkInterface iface = i.nextElement();
-                // Use the interface with proper INET addresses only.
-                if (iface.getInetAddresses().hasMoreElements()) {
-                    ifaces.add(iface);
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            if (interfaces != null) {
+                while (interfaces.hasMoreElements()) {
+                    NetworkInterface iface = interfaces.nextElement();
+                    // Use the interface with proper INET addresses only.
+                    if (SocketUtils.addressesFromNetworkInterface(iface).hasMoreElements()) {
+                        ifaces.add(iface);
+                    }
                 }
             }
         } catch (SocketException e) {
@@ -171,7 +188,7 @@ public final class NetUtil {
         NetworkInterface loopbackIface = null;
         InetAddress loopbackAddr = null;
         loop: for (NetworkInterface iface: ifaces) {
-            for (Enumeration<InetAddress> i = iface.getInetAddresses(); i.hasMoreElements();) {
+            for (Enumeration<InetAddress> i = SocketUtils.addressesFromNetworkInterface(iface); i.hasMoreElements();) {
                 InetAddress addr = i.nextElement();
                 if (addr.isLoopbackAddress()) {
                     // Found
@@ -187,7 +204,7 @@ public final class NetUtil {
             try {
                 for (NetworkInterface iface: ifaces) {
                     if (iface.isLoopback()) {
-                        Enumeration<InetAddress> i = iface.getInetAddresses();
+                        Enumeration<InetAddress> i = SocketUtils.addressesFromNetworkInterface(iface);
                         if (i.hasMoreElements()) {
                             // Found the one with INET address.
                             loopbackIface = iface;
@@ -257,12 +274,27 @@ public final class NetUtil {
                             logger.debug("{}: {}", file, somaxconn);
                         }
                     } else {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("{}: {} (non-existent)", file, somaxconn);
+                        // Try to get from sysctl
+                        Integer tmp = null;
+                        if (SystemPropertyUtil.getBoolean("io.netty.net.somaxconn.trySysctl", false)) {
+                            tmp = sysctlGetInt("kern.ipc.somaxconn");
+                            if (tmp == null) {
+                                tmp = sysctlGetInt("kern.ipc.soacceptqueue");
+                                if (tmp != null) {
+                                    somaxconn = tmp;
+                                }
+                            } else {
+                                somaxconn = tmp;
+                            }
+                        }
+
+                        if (tmp == null) {
+                            logger.debug("Failed to get SOMAXCONN from sysctl and file {}. Default: {}", file,
+                                         somaxconn);
                         }
                     }
                 } catch (Exception e) {
-                    logger.debug("Failed to get SOMAXCONN from: {}", file, e);
+                    logger.debug("Failed to get SOMAXCONN from sysctl and file {}. Default: {}", file, somaxconn, e);
                 } finally {
                     if (in != null) {
                         try {
@@ -278,15 +310,61 @@ public final class NetUtil {
     }
 
     /**
-     * Returns {@code true} if ipv4 should be prefered on a system that supports ipv4 and ipv6.
+     * This will execute <a href ="https://www.freebsd.org/cgi/man.cgi?sysctl(8)">sysctl</a> with the {@code sysctlKey}
+     * which is expected to return the numeric value for for {@code sysctlKey}.
+     * @param sysctlKey The key which the return value corresponds to.
+     * @return The <a href ="https://www.freebsd.org/cgi/man.cgi?sysctl(8)">sysctl</a> value for {@code sysctlKey}.
+     */
+    private static Integer sysctlGetInt(String sysctlKey) throws IOException {
+        Process process = new ProcessBuilder("sysctl", sysctlKey).start();
+        try {
+            InputStream is = process.getInputStream();
+            InputStreamReader isr = new InputStreamReader(is);
+            BufferedReader br = new BufferedReader(isr);
+            try {
+                String line = br.readLine();
+                if (line.startsWith(sysctlKey)) {
+                    for (int i = line.length() - 1; i > sysctlKey.length(); --i) {
+                        if (!Character.isDigit(line.charAt(i))) {
+                            return Integer.valueOf(line.substring(i + 1, line.length()));
+                        }
+                    }
+                }
+                return null;
+            } finally {
+                br.close();
+            }
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if IPv4 should be used even if the system supports both IPv4 and IPv6. Setting this
+     * property to {@code true} will disable IPv6 support. The default value of this property is {@code false}.
+     *
+     * @see <a href="https://docs.oracle.com/javase/8/docs/api/java/net/doc-files/net-properties.html">Java SE
+     *      networking properties</a>
      */
     public static boolean isIpV4StackPreferred() {
         return IPV4_PREFERRED;
     }
 
     /**
-     * Creates an byte[] based on an ipAddressString. No error handling is
-     * performed here.
+     * Returns {@code true} if an IPv6 address should be preferred when a host has both an IPv4 address and an IPv6
+     * address. The default value of this property is {@code false}.
+     *
+     * @see <a href="https://docs.oracle.com/javase/8/docs/api/java/net/doc-files/net-properties.html">Java SE
+     *      networking properties</a>
+     */
+    public static boolean isIpV6AddressesPreferred() {
+        return IPV6_ADDRESSES_PREFERRED;
+    }
+
+    /**
+     * Creates an byte[] based on an ipAddressString. No error handling is performed here.
      */
     public static byte[] createByteArrayFromIpAddressString(String ipAddressString) {
 
@@ -314,110 +392,9 @@ public final class NetUtil {
                 ipAddressString = ipAddressString.substring(0, percentPos);
             }
 
-            StringTokenizer tokenizer = new StringTokenizer(ipAddressString, ":.", true);
-            ArrayList<String> hexStrings = new ArrayList<String>();
-            ArrayList<String> decStrings = new ArrayList<String>();
-            String token = "";
-            String prevToken = "";
-            int doubleColonIndex = -1; // If a double colon exists, we need to
-            // insert 0s.
-
-            // Go through the tokens, including the seperators ':' and '.'
-            // When we hit a : or . the previous token will be added to either
-            // the hex list or decimal list. In the case where we hit a ::
-            // we will save the index of the hexStrings so we can add zeros
-            // in to fill out the string
-            while (tokenizer.hasMoreTokens()) {
-                prevToken = token;
-                token = tokenizer.nextToken();
-
-                if (":".equals(token)) {
-                    if (":".equals(prevToken)) {
-                        doubleColonIndex = hexStrings.size();
-                    } else if (!prevToken.isEmpty()) {
-                        hexStrings.add(prevToken);
-                    }
-                } else if (".".equals(token)) {
-                    decStrings.add(prevToken);
-                }
-            }
-
-            if (":".equals(prevToken)) {
-                if (":".equals(token)) {
-                    doubleColonIndex = hexStrings.size();
-                } else {
-                    hexStrings.add(token);
-                }
-            } else if (".".equals(prevToken)) {
-                decStrings.add(token);
-            }
-
-            // figure out how many hexStrings we should have
-            // also check if it is a IPv4 address
-            int hexStringsLength = 8;
-
-            // If we have an IPv4 address tagged on at the end, subtract
-            // 4 bytes, or 2 hex words from the total
-            if (!decStrings.isEmpty()) {
-                hexStringsLength -= 2;
-            }
-
-            // if we hit a double Colon add the appropriate hex strings
-            if (doubleColonIndex != -1) {
-                int numberToInsert = hexStringsLength - hexStrings.size();
-                for (int i = 0; i < numberToInsert; i ++) {
-                    hexStrings.add(doubleColonIndex, "0");
-                }
-            }
-
-            byte[] ipByteArray = new byte[IPV6_BYTE_COUNT];
-
-            // Finally convert these strings to bytes...
-            for (int i = 0; i < hexStrings.size(); i ++) {
-                convertToBytes(hexStrings.get(i), ipByteArray, i << 1);
-            }
-
-            // Now if there are any decimal values, we know where they go...
-            for (int i = 0; i < decStrings.size(); i ++) {
-                ipByteArray[i + 12] = (byte) (Integer.parseInt(decStrings.get(i)) & 255);
-            }
-            return ipByteArray;
+            return getIPv6ByName(ipAddressString, true);
         }
         return null;
-    }
-
-    /**
-     * Converts a 4 character hex word into a 2 byte word equivalent
-     */
-    private static void convertToBytes(String hexWord, byte[] ipByteArray, int byteIndex) {
-
-        int hexWordLength = hexWord.length();
-        int hexWordIndex = 0;
-        ipByteArray[byteIndex] = 0;
-        ipByteArray[byteIndex + 1] = 0;
-        int charValue;
-
-        // high order 4 bits of first byte
-        if (hexWordLength > 3) {
-            charValue = getIntValue(hexWord.charAt(hexWordIndex ++));
-            ipByteArray[byteIndex] |= charValue << 4;
-        }
-
-        // low order 4 bits of the first byte
-        if (hexWordLength > 2) {
-            charValue = getIntValue(hexWord.charAt(hexWordIndex ++));
-            ipByteArray[byteIndex] |= charValue;
-        }
-
-        // high order 4 bits of second byte
-        if (hexWordLength > 1) {
-            charValue = getIntValue(hexWord.charAt(hexWordIndex ++));
-            ipByteArray[byteIndex + 1] |= charValue << 4;
-        }
-
-        // low order 4 bits of the first byte
-        charValue = getIntValue(hexWord.charAt(hexWordIndex));
-        ipByteArray[byteIndex + 1] |= charValue & 15;
     }
 
     private static int getIntValue(char c) {
@@ -483,39 +460,36 @@ public final class NetUtil {
      * @throws IllegalArgumentException
      *         if {@code length} is not {@code 4} nor {@code 16}
      */
+    public static String bytesToIpAddress(byte[] bytes) {
+        return bytesToIpAddress(bytes, 0, bytes.length);
+    }
+
+    /**
+     * Converts 4-byte or 16-byte data into an IPv4 or IPv6 string respectively.
+     *
+     * @throws IllegalArgumentException
+     *         if {@code length} is not {@code 4} nor {@code 16}
+     */
     public static String bytesToIpAddress(byte[] bytes, int offset, int length) {
-        if (length == 4) {
-            StringBuilder buf = new StringBuilder(15);
-
-            buf.append(bytes[offset ++] >> 24 & 0xff);
-            buf.append('.');
-            buf.append(bytes[offset ++] >> 16 & 0xff);
-            buf.append('.');
-            buf.append(bytes[offset ++] >> 8 & 0xff);
-            buf.append('.');
-            buf.append(bytes[offset] & 0xff);
-
-            return buf.toString();
-        }
-
-        if (length == 16) {
-            final StringBuilder sb = new StringBuilder(39);
-            final int endOffset = offset + 14;
-
-            for (; offset < endOffset; offset += 2) {
-                StringUtil.toHexString(sb, bytes, offset, 2);
-                sb.append(':');
+        switch (length) {
+            case 4: {
+                return new StringBuilder(15)
+                        .append(bytes[offset] & 0xff)
+                        .append('.')
+                        .append(bytes[offset + 1] & 0xff)
+                        .append('.')
+                        .append(bytes[offset + 2] & 0xff)
+                        .append('.')
+                        .append(bytes[offset + 3] & 0xff).toString();
             }
-            StringUtil.toHexString(sb, bytes, offset, 2);
-
-            return sb.toString();
+            case 16:
+                return toAddressString(bytes, offset, false);
+            default:
+                throw new IllegalArgumentException("length: " + length + " (expected: 4 or 16)");
         }
-
-        throw new IllegalArgumentException("length: " + length + " (expected: 4 or 16)");
     }
 
     public static boolean isValidIpV6Address(String ipAddress) {
-        int length = ipAddress.length();
         boolean doubleColon = false;
         int numberOfColons = 0;
         int numberOfPeriods = 0;
@@ -554,17 +528,47 @@ public final class NetUtil {
                     numberOfPeriods ++;
                     if (numberOfPeriods > 3) {
                         return false;
+                    } else if (numberOfPeriods == 1) {
+                        // Verify this address is of the correct structure to contain an IPv4 address.
+                        // It must be IPv4-Mapped or IPv4-Compatible
+                        // (see https://tools.ietf.org/html/rfc4291#section-2.5.5).
+                        int j = i - word.length() - 2; // index of character before the previous ':'.
+                        final int beginColonIndex = ipAddress.lastIndexOf(':', j);
+                        if (beginColonIndex == -1) {
+                            return false;
+                        }
+                        char tmpChar = ipAddress.charAt(j);
+                        if (isValidIPv4MappedChar(tmpChar)) {
+                            if (j - beginColonIndex != 4 ||
+                                !isValidIPv4MappedChar(ipAddress.charAt(j - 1)) ||
+                                !isValidIPv4MappedChar(ipAddress.charAt(j - 2)) ||
+                                !isValidIPv4MappedChar(ipAddress.charAt(j - 3))) {
+                                return false;
+                            }
+                            j -= 5;
+                        } else if (tmpChar == '0' || tmpChar == ':') {
+                            --j;
+                        } else {
+                            return false;
+                        }
+
+                        // a special case ::1:2:3:4:5:d.d.d.d allows 7 colons with an
+                        // IPv4 ending, otherwise 7 :'s is bad
+                        if ((numberOfColons != 6 && !doubleColon) || numberOfColons > 7 ||
+                            (numberOfColons == 7 && (ipAddress.charAt(startOffset) != ':' ||
+                                ipAddress.charAt(1 + startOffset) != ':'))) {
+                            return false;
+                        }
+
+                        for (; j >= startOffset; --j) {
+                            tmpChar = ipAddress.charAt(j);
+                            if (tmpChar != '0' && tmpChar != ':') {
+                                return false;
+                            }
+                        }
                     }
+
                     if (!isValidIp4Word(word.toString())) {
-                        return false;
-                    }
-                    if (numberOfColons != 6 && !doubleColon) {
-                        return false;
-                    }
-                    // a special case ::1:2:3:4:5:d.d.d.d allows 7 colons with an
-                    // IPv4 ending, otherwise 7 :'s is bad
-                    if (numberOfColons == 7 && ipAddress.charAt(startOffset) != ':' &&
-                        ipAddress.charAt(1 + startOffset) != ':') {
                         return false;
                     }
                     word.delete(0, word.length());
@@ -574,12 +578,12 @@ public final class NetUtil {
                     // FIX "IP6 mechanism syntax #ip6-bad1"
                     // An IPV6 address cannot start with a single ":".
                     // Either it can starti with "::" or with a number.
-                    if (i == startOffset && (ipAddress.length() <= i || ipAddress.charAt(i + 1) != ':')) {
+                    if (i == startOffset && (endOffset <= i || ipAddress.charAt(i + 1) != ':')) {
                         return false;
                     }
                     // END FIX "IP6 mechanism syntax #ip6-bad1"
                     numberOfColons ++;
-                    if (numberOfColons > 7) {
+                    if (numberOfColons > 8) {
                         return false;
                     }
                     if (numberOfPeriods > 0) {
@@ -608,7 +612,7 @@ public final class NetUtil {
         // Check if we have an IPv4 ending
         if (numberOfPeriods > 0) {
             // There is a test case with 7 colons and valid ipv4 this should resolve it
-            if (numberOfPeriods != 3 || !(isValidIp4Word(word.toString()) && numberOfColons < 7)) {
+            if (numberOfPeriods != 3 || !(isValidIp4Word(word.toString()) && (numberOfColons < 7 || doubleColon))) {
                 return false;
             }
         } else {
@@ -618,11 +622,15 @@ public final class NetUtil {
                 return false;
             }
 
-            // If we have an empty word at the end, it means we ended in either
-            // a : or a .
-            // If we did not end in :: then this is invalid
-            if (word.length() == 0 && ipAddress.charAt(length - 1 - startOffset) == ':' &&
-                ipAddress.charAt(length - 2 - startOffset) != ':') {
+            if (word.length() == 0) {
+                // If we have an empty word at the end, it means we ended in either
+                // a : or a .
+                // If we did not end in :: then this is invalid
+                if (ipAddress.charAt(endOffset - 1) == ':' &&
+                    ipAddress.charAt(endOffset - 2) != ':') {
+                    return false;
+                }
+            } else if (numberOfColons == 8 && ipAddress.charAt(startOffset) != ':') {
                 return false;
             }
         }
@@ -650,6 +658,24 @@ public final class NetUtil {
 
     private static boolean isValidNumericChar(char c) {
         return c >= '0' && c <= '9';
+    }
+
+    private static boolean isValidIPv4MappedChar(char c) {
+        return c == 'f' || c == 'F';
+    }
+
+    private static boolean isValidIPv4MappedSeparators(byte b0, byte b1, boolean mustBeZero) {
+        // We allow IPv4 Mapped (https://tools.ietf.org/html/rfc4291#section-2.5.5.1)
+        // and IPv4 compatible (https://tools.ietf.org/html/rfc4291#section-2.5.5.1).
+        // The IPv4 compatible is deprecated, but it allows parsing of plain IPv4 addressed into IPv6-Mapped addresses.
+        return b0 == b1 && (b0 == 0 || !mustBeZero && b1 == -1);
+    }
+
+    private static boolean isValidIPv4Mapped(byte[] bytes, int currentIndex, int compressBegin, int compressLength) {
+        final boolean mustBeZero = compressBegin + compressLength >= 14;
+        return currentIndex <= 12 && currentIndex >= 2 && (!mustBeZero || compressBegin < 12) &&
+                isValidIPv4MappedSeparators(bytes[currentIndex - 1], bytes[currentIndex - 2], mustBeZero) &&
+                PlatformDependent.isZero(bytes, 0, currentIndex - 3);
     }
 
     /**
@@ -721,11 +747,37 @@ public final class NetUtil {
      * @param ipv4Mapped
      * <ul>
      * <li>{@code true} To allow IPv4 mapped inputs to be translated into {@link Inet6Address}</li>
-     * <li>{@code false} Don't turn IPv4 addressed to mapped addresses</li>
+     * <li>{@code false} Consider IPv4 mapped addresses as invalid.</li>
      * </ul>
      * @return {@link Inet6Address} representation of the {@code ip} or {@code null} if not a valid IP address.
      */
     public static Inet6Address getByName(CharSequence ip, boolean ipv4Mapped) {
+        byte[] bytes = getIPv6ByName(ip, ipv4Mapped);
+        if (bytes == null) {
+            return null;
+        }
+        try {
+            return Inet6Address.getByAddress(null, bytes, -1);
+        } catch (UnknownHostException e) {
+            throw new RuntimeException(e); // Should never happen
+        }
+    }
+
+    /**
+     * Returns the byte array representation of a {@link CharSequence} IP address.
+     * <p>
+     * The {@code ipv4Mapped} parameter specifies how IPv4 addresses should be treated.
+     * "IPv4 mapped" format as
+     * defined in <a href="http://tools.ietf.org/html/rfc4291#section-2.5.5">rfc 4291 section 2</a> is supported.
+     * @param ip {@link CharSequence} IP address to be converted to a {@link Inet6Address}
+     * @param ipv4Mapped
+     * <ul>
+     * <li>{@code true} To allow IPv4 mapped inputs to be translated into {@link Inet6Address}</li>
+     * <li>{@code false} Consider IPv4 mapped addresses as invalid.</li>
+     * </ul>
+     * @return byte array representation of the {@code ip} or {@code null} if not a valid IP address.
+     */
+    private static byte[] getIPv6ByName(CharSequence ip, boolean ipv4Mapped) {
         final byte[] bytes = new byte[IPV6_BYTE_COUNT];
         final int ipLength = ip.length();
         int compressBegin = 0;
@@ -734,17 +786,17 @@ public final class NetUtil {
         int value = 0;
         int begin = -1;
         int i = 0;
-        int ipv6Seperators = 0;
-        int ipv4Seperators = 0;
+        int ipv6Separators = 0;
+        int ipv4Separators = 0;
         int tmp;
         boolean needsShift = false;
         for (; i < ipLength; ++i) {
             final char c = ip.charAt(i);
             switch (c) {
             case ':':
-                ++ipv6Seperators;
+                ++ipv6Separators;
                 if (i - begin > IPV6_MAX_CHAR_BETWEEN_SEPARATOR ||
-                        ipv4Seperators > 0 || ipv6Seperators > IPV6_MAX_SEPARATORS ||
+                        ipv4Separators > 0 || ipv6Separators > IPV6_MAX_SEPARATORS ||
                         currentIndex + 1 >= bytes.length) {
                     return null;
                 }
@@ -765,8 +817,8 @@ public final class NetUtil {
                     if (compressBegin != 0 || (tmp < ipLength && ip.charAt(tmp) == ':')) {
                         return null;
                     }
-                    ++ipv6Seperators;
-                    needsShift = ipv6Seperators == 2 && value == 0;
+                    ++ipv6Separators;
+                    needsShift = ipv6Separators == 2 && value == 0;
                     compressBegin = currentIndex;
                     compressLength = bytes.length - compressBegin - 2;
                     ++i;
@@ -775,22 +827,27 @@ public final class NetUtil {
                 begin = -1;
                 break;
             case '.':
-                ++ipv4Seperators;
-                if (i - begin > IPV4_MAX_CHAR_BETWEEN_SEPARATOR
-                        || ipv4Seperators > IPV4_SEPARATORS
-                        || (ipv6Seperators > 0 && (currentIndex + compressLength < 12))
+                ++ipv4Separators;
+                tmp = i - begin; // tmp is the length of the current segment.
+                if (tmp > IPV4_MAX_CHAR_BETWEEN_SEPARATOR
+                        || begin < 0
+                        || ipv4Separators > IPV4_SEPARATORS
+                        || (ipv6Separators > 0 && (currentIndex + compressLength < 12))
                         || i + 1 >= ipLength
                         || currentIndex >= bytes.length
-                        || begin < 0
-                        || (begin == 0 && (i == 3 && (!isValidNumericChar(ip.charAt(2)) ||
-                                                      !isValidNumericChar(ip.charAt(1)) ||
-                                                      !isValidNumericChar(ip.charAt(0))) ||
-                                           i == 2 && (!isValidNumericChar(ip.charAt(1)) ||
-                                                      !isValidNumericChar(ip.charAt(0))) ||
-                                           i == 1 && !isValidNumericChar(ip.charAt(0))))) {
+                        || ipv4Separators == 1 &&
+                            // We also parse pure IPv4 addresses as IPv4-Mapped for ease of use.
+                            ((!ipv4Mapped || currentIndex != 0 && !isValidIPv4Mapped(bytes, currentIndex,
+                                                                                     compressBegin, compressLength)) ||
+                                (tmp == 3 && (!isValidNumericChar(ip.charAt(i - 1)) ||
+                                              !isValidNumericChar(ip.charAt(i - 2)) ||
+                                              !isValidNumericChar(ip.charAt(i - 3))) ||
+                                 tmp == 2 && (!isValidNumericChar(ip.charAt(i - 1)) ||
+                                              !isValidNumericChar(ip.charAt(i - 2))) ||
+                                 tmp == 1 && !isValidNumericChar(ip.charAt(i - 1))))) {
                     return null;
                 }
-                value <<= (IPV4_MAX_CHAR_BETWEEN_SEPARATOR - (i - begin)) << 2;
+                value <<= (IPV4_MAX_CHAR_BETWEEN_SEPARATOR - tmp) << 2;
 
                 // The value integer holds at most 3 bytes from right (most significant) to left (least significant).
                 // The following bit shifting is to restructure the bytes to be left (most significant) to
@@ -804,7 +861,7 @@ public final class NetUtil {
                 begin = -1;
                 break;
             default:
-                if (!isValidHexChar(c) || (ipv4Seperators > 0 && !isValidNumericChar(c))) {
+                if (!isValidHexChar(c) || (ipv4Separators > 0 && !isValidNumericChar(c))) {
                     return null;
                 }
                 if (begin < 0) {
@@ -823,18 +880,17 @@ public final class NetUtil {
 
         final boolean isCompressed = compressBegin > 0;
         // Finish up last set of data that was accumulated in the loop (or before the loop)
-        if (ipv4Seperators > 0) {
+        if (ipv4Separators > 0) {
             if (begin > 0 && i - begin > IPV4_MAX_CHAR_BETWEEN_SEPARATOR ||
-                    ipv4Seperators != IPV4_SEPARATORS ||
+                    ipv4Separators != IPV4_SEPARATORS ||
                     currentIndex >= bytes.length) {
                 return null;
             }
-            if (ipv6Seperators == 0) {
+            if (ipv6Separators == 0) {
                 compressLength = 12;
-            } else if (ipv6Seperators >= IPV6_MIN_SEPARATORS &&
-                           ip.charAt(ipLength - 1) != ':' &&
-                           (!isCompressed && (ipv6Seperators == 6 && ip.charAt(0) != ':') ||
-                            isCompressed && (ipv6Seperators + 1 < IPV6_MAX_SEPARATORS &&
+            } else if (ipv6Separators >= IPV6_MIN_SEPARATORS &&
+                           (!isCompressed && (ipv6Separators == 6 && ip.charAt(0) != ':') ||
+                            isCompressed && (ipv6Separators < IPV6_MAX_SEPARATORS &&
                                              (ip.charAt(0) != ':' || compressBegin <= 2)))) {
                 compressLength -= 2;
             } else {
@@ -853,14 +909,16 @@ public final class NetUtil {
         } else {
             tmp = ipLength - 1;
             if (begin > 0 && i - begin > IPV6_MAX_CHAR_BETWEEN_SEPARATOR ||
-                    ipv6Seperators < IPV6_MIN_SEPARATORS ||
-                    !isCompressed && (ipv6Seperators + 1 != IPV6_MAX_SEPARATORS  ||
+                    ipv6Separators < IPV6_MIN_SEPARATORS ||
+                    !isCompressed && (ipv6Separators + 1 != IPV6_MAX_SEPARATORS  ||
                                       ip.charAt(0) == ':' || ip.charAt(tmp) == ':') ||
-                    isCompressed && (ipv6Seperators > IPV6_MAX_SEPARATORS ||
-                        (ipv6Seperators == IPV6_MAX_SEPARATORS &&
+                    isCompressed && (ipv6Separators > IPV6_MAX_SEPARATORS ||
+                        (ipv6Separators == IPV6_MAX_SEPARATORS &&
                           (compressBegin <= 2 && ip.charAt(0) != ':' ||
                            compressBegin >= 14 && ip.charAt(tmp) != ':'))) ||
-                    currentIndex + 1 >= bytes.length) {
+                    currentIndex + 1 >= bytes.length ||
+                    begin < 0 && ip.charAt(tmp - 1) != ':' ||
+                    compressBegin > 2 && ip.charAt(0) == ':') {
                 return null;
             }
             if (begin >= 0 && i - begin <= IPV6_MAX_CHAR_BETWEEN_SEPARATOR) {
@@ -900,17 +958,59 @@ public final class NetUtil {
             }
         }
 
-        if (ipv4Mapped && ipv4Seperators > 0 &&
-                bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0 && bytes[4] == 0 &&
-                bytes[5] == 0 && bytes[6] == 0 && bytes[7] == 0 && bytes[8] == 0 && bytes[9] == 0) {
+        if (ipv4Separators > 0) {
+            // We only support IPv4-Mapped addresses [1] because IPv4-Compatible addresses are deprecated [2].
+            // [1] https://tools.ietf.org/html/rfc4291#section-2.5.5.2
+            // [2] https://tools.ietf.org/html/rfc4291#section-2.5.5.1
             bytes[10] = bytes[11] = (byte) 0xff;
         }
 
-        try {
-            return Inet6Address.getByAddress(null, bytes, -1);
-        } catch (UnknownHostException e) {
-            throw new RuntimeException(e); // Should never happen
+        return bytes;
+    }
+
+    /**
+     * Returns the {@link String} representation of an {@link InetSocketAddress}.
+     * <p>
+     * The output does not include Scope ID.
+     * @param addr {@link InetSocketAddress} to be converted to an address string
+     * @return {@code String} containing the text-formatted IP address
+     */
+    public static String toSocketAddressString(InetSocketAddress addr) {
+        String port = String.valueOf(addr.getPort());
+        final StringBuilder sb;
+
+        if (addr.isUnresolved()) {
+            String hostString = PlatformDependent.javaVersion() >= 7 ? addr.getHostString() : addr.getHostName();
+            sb = newSocketAddressStringBuilder(hostString, port, !isValidIpV6Address(hostString));
+        } else {
+            InetAddress address = addr.getAddress();
+            String hostString = toAddressString(address);
+            sb = newSocketAddressStringBuilder(hostString, port, address instanceof Inet4Address);
         }
+        return sb.append(':').append(port).toString();
+    }
+
+    /**
+     * Returns the {@link String} representation of a host port combo.
+     */
+    public static String toSocketAddressString(String host, int port) {
+        String portStr = String.valueOf(port);
+        return newSocketAddressStringBuilder(
+                host, portStr, !isValidIpV6Address(host)).append(':').append(portStr).toString();
+    }
+
+    private static StringBuilder newSocketAddressStringBuilder(String host, String port, boolean ipv4) {
+        int hostLen = host.length();
+        if (ipv4) {
+            // Need to include enough space for hostString:port.
+            return new StringBuilder(hostLen + 1 + port.length()).append(host);
+        }
+        // Need to include enough space for [hostString]:port.
+        StringBuilder stringBuilder = new StringBuilder(hostLen + 3 + port.length());
+        if (hostLen > 1 && host.charAt(0) == '[' && host.charAt(hostLen - 1) == ']') {
+            return stringBuilder.append(host);
+        }
+        return stringBuilder.append('[').append(host).append(']');
     }
 
     /**
@@ -958,13 +1058,17 @@ public final class NetUtil {
             return ip.getHostAddress();
         }
         if (!(ip instanceof Inet6Address)) {
-            throw new IllegalArgumentException("Unhandled type: " + ip.getClass());
+            throw new IllegalArgumentException("Unhandled type: " + ip);
         }
 
-        final byte[] bytes = ip.getAddress();
+        return toAddressString(ip.getAddress(), 0, ipv4Mapped);
+    }
+
+    private static String toAddressString(byte[] bytes, int offset, boolean ipv4Mapped) {
         final int[] words = new int[IPV6_WORD_COUNT];
         int i;
-        for (i = 0; i < words.length; ++i) {
+        final int end = offset + words.length;
+        for (i = offset; i < end; ++i) {
             words[i] = ((bytes[i << 1] & 0xff) << 8) | (bytes[(i << 1) + 1] & 0xff);
         }
 

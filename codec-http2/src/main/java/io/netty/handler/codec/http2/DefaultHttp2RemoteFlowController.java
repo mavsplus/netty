@@ -25,6 +25,8 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 
 import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_WINDOW_SIZE;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_WEIGHT;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MIN_WEIGHT;
 import static io.netty.handler.codec.http2.Http2Error.FLOW_CONTROL_ERROR;
 import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.streamError;
@@ -176,6 +178,16 @@ public class DefaultHttp2RemoteFlowController implements Http2RemoteFlowControll
         monitor.channelWritabilityChange();
     }
 
+    @Override
+    public void updateDependencyTree(int childStreamId, int parentStreamId, short weight, boolean exclusive) {
+        // It is assumed there are all validated at a higher level. For example in the Http2FrameReader.
+        assert weight >= MIN_WEIGHT && weight <= MAX_WEIGHT : "Invalid weight";
+        assert childStreamId != parentStreamId : "A stream cannot depend on itself";
+        assert childStreamId > 0 && parentStreamId >= 0 : "childStreamId must be > 0. parentStreamId must be >= 0.";
+
+        streamByteDistributor.updateDependencyTree(childStreamId, parentStreamId, weight, exclusive);
+    }
+
     private boolean isChannelWritable() {
         return ctx != null && isChannelWritable0();
     }
@@ -234,12 +246,12 @@ public class DefaultHttp2RemoteFlowController implements Http2RemoteFlowControll
     }
 
     private int maxUsableChannelBytes() {
-        // If the channel isWritable, allow at least minUseableChannelBytes.
+        // If the channel isWritable, allow at least minUsableChannelBytes.
         int channelWritableBytes = (int) min(Integer.MAX_VALUE, ctx.channel().bytesBeforeUnwritable());
-        int useableBytes = channelWritableBytes > 0 ? max(channelWritableBytes, minUsableChannelBytes()) : 0;
+        int usableBytes = channelWritableBytes > 0 ? max(channelWritableBytes, minUsableChannelBytes()) : 0;
 
         // Clip the usable bytes by the connection window.
-        return min(connectionState.windowSize(), useableBytes);
+        return min(connectionState.windowSize(), usableBytes);
     }
 
     /**
@@ -276,7 +288,7 @@ public class DefaultHttp2RemoteFlowController implements Http2RemoteFlowControll
         private BooleanSupplier isWritableSupplier = new BooleanSupplier() {
             @Override
             public boolean get() throws Exception {
-                return windowSize() - pendingBytes() > 0;
+                return windowSize() > pendingBytes();
             }
         };
 
@@ -542,6 +554,7 @@ public class DefaultHttp2RemoteFlowController implements Http2RemoteFlowControll
      * Abstract class which provides common functionality for writability monitor implementations.
      */
     private class WritabilityMonitor {
+        private boolean inWritePendingBytes;
         private long totalPendingBytes;
         private final Writer writer = new StreamByteDistributor.Writer() {
             @Override
@@ -613,16 +626,28 @@ public class DefaultHttp2RemoteFlowController implements Http2RemoteFlowControll
         }
 
         final void writePendingBytes() throws Http2Exception {
-            int bytesToWrite = writableBytes();
-
-            // Make sure we always write at least once, regardless if we have bytesToWrite or not.
-            // This ensures that zero-length frames will always be written.
-            for (;;) {
-                if (!streamByteDistributor.distribute(bytesToWrite, writer) ||
-                    (bytesToWrite = writableBytes()) <= 0 ||
-                    !isChannelWritable0()) {
-                    break;
+            // Reentry is not permitted during the byte distribution process. It may lead to undesirable distribution of
+            // bytes and even infinite loops. We protect against reentry and make sure each call has an opportunity to
+            // cause a distribution to occur. This may be useful for example if the channel's writability changes from
+            // Writable -> Not Writable (because we are writing) -> Writable (because the user flushed to make more room
+            // in the channel outbound buffer).
+            if (inWritePendingBytes) {
+                return;
+            }
+            inWritePendingBytes = true;
+            try {
+                int bytesToWrite = writableBytes();
+                // Make sure we always write at least once, regardless if we have bytesToWrite or not.
+                // This ensures that zero-length frames will always be written.
+                for (;;) {
+                    if (!streamByteDistributor.distribute(bytesToWrite, writer) ||
+                        (bytesToWrite = writableBytes()) <= 0 ||
+                        !isChannelWritable0()) {
+                        break;
+                    }
                 }
+            } finally {
+                inWritePendingBytes = false;
             }
         }
 
